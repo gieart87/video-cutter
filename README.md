@@ -4,8 +4,9 @@ Removes the silent parts of a video automatically. Useful for tutorials and
 screen recordings: you talk, pause, think, talk again — this tool cuts out
 the pauses for you.
 
-The output keeps the **same resolution, frame rate and bit depth** as your
-original video. Nothing is scaled down.
+The output keeps the **same resolution and bit depth** as your original
+video. Nothing is scaled down. With `--youtube` it can also crop the video
+to a full-screen 16:9 frame (no black bars on YouTube).
 
 ## What you need
 
@@ -101,10 +102,45 @@ Example:
 python3 auto_trim_fast.py my-video.mov --noise -35 --min-silence 0.8
 ```
 
+## Step 6 — Make it full screen on YouTube (optional)
+
+Screen recordings from a Mac are usually not 16:9 (for example 2992x1934).
+On YouTube that shows black bars on the left and right. Add `--youtube` to
+crop the video to exactly 16:9 so it fills the whole player:
+
+```bash
+python3 auto_trim_fast.py my-video.mov --youtube
+```
+
+By default this also scales the video to **4K (3840x2160)**. Even if your
+viewers watch in 1080p, YouTube gives 4K uploads a much higher bitrate, so
+small text like code and terminal output stays sharp.
+
+Pick a different size if you want:
+
+| Option | Output size | Notes |
+|---|---|---|
+| `--youtube` or `--youtube 4k` | 3840x2160 | Sharpest on YouTube (recommended) |
+| `--youtube 1440p` | 2560x1440 | Smaller file |
+| `--youtube 1080p` | 1920x1080 | Smallest file, text is less sharp |
+| `--youtube native` | e.g. 2976x1674 | Only crops, no scaling |
+
+Cropping removes a strip from the top and bottom (or left and right). Choose
+which part to keep:
+
+| Option | What is kept |
+|---|---|
+| `--crop-anchor center` (default) | The middle. Cuts a bit of the top (menu bar) and bottom (Dock). |
+| `--crop-anchor top` | The top, e.g. browser tabs. Cuts more from the bottom. |
+| `--crop-anchor bottom` | The bottom. Cuts more from the top. |
+
+Tip: check the result with `--dry-run` first. It shows the crop size before
+rendering.
+
 ## Quality options
 
-By default the video is saved as **H.264 at very high quality (CRF 16)**,
-which plays everywhere and is great for YouTube.
+By default the video is saved as **H.264 at visually lossless quality
+(CRF 12)**, which plays everywhere and is great for YouTube.
 
 | Option | What you get | When to use it |
 |---|---|---|
@@ -114,16 +150,22 @@ which plays everywhere and is great for YouTube.
 
 More control:
 
-- `--crf 12` — even higher quality (bigger file). Lower number = better. Default: 16 (h264), 18 (hevc).
+- `--crf 10` — even higher quality (bigger file). Lower number = better. Default: 12 (h264), 14 (hevc).
+- `--fps 30` — choose the output frame rate. Default: same as the source.
 - `--preset slower` — smaller file at the same quality, but slower to render. Default: `slow`.
 - `--no-denoise` — turn off background noise reduction on the audio.
 
 What is always kept from the original:
 
-- Resolution (e.g. 1920x1080, 2560x1440, 3840x2160)
+- Resolution (e.g. 1920x1080, 2560x1440, 3840x2160), unless you use `--youtube`
 - Frame rate (e.g. 29.97, 30, 60 fps)
 - 10-bit color, if the source is 10-bit
 - Color settings (color space, range)
+
+About screen recordings: macOS records with a *variable* frame rate (new
+frames only when something changes on screen). The tool converts these to a
+smooth, constant **60 fps**, so no frames are dropped and mouse movement and
+scrolling stay smooth.
 
 ## All options
 
@@ -134,6 +176,10 @@ python3 auto_trim_fast.py INPUT [OUTPUT] [options]
   --min-silence SEC   only cut pauses longer than this (default: 1.0)
   --pad-before SEC    time kept before talking starts (default: 0.2)
   --pad-after SEC     time kept after talking ends (default: 0.3)
+  --youtube [SIZE]    crop to full-screen 16:9; SIZE = 4k (default), 1440p,
+                      1080p, or native
+  --crop-anchor POS   part to keep when cropping: center (default), top, bottom
+  --fps N             output frame rate (default: source; 60 for screen recordings)
   --codec NAME        h264 (default), hevc, or prores
   --crf N             quality for h264/hevc, lower = better
   --preset NAME       x264/x265 speed preset (default: slow)
@@ -147,4 +193,5 @@ Run `python3 auto_trim_fast.py --help` to see this list anytime.
 
 - **"No speech found"** — your audio is quieter than the threshold. Try `--noise -40` or `--noise -50`.
 - **"ffmpeg: command not found"** — ffmpeg is not installed, see Step 1.
-- **Rendering is slow** — that is normal for high quality. Use `--preset medium` or `--preset fast` to speed it up (slightly bigger file, same visual quality).
+- **Important parts are cut off with `--youtube`** — try `--crop-anchor top` or `--crop-anchor bottom`, or check with `--dry-run`.
+- **Rendering is slow** — that is normal for high quality (4K takes about as long as the video itself). Use `--preset medium` or `--preset fast` to speed it up (slightly bigger file, same visual quality).

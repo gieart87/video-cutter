@@ -12,10 +12,18 @@ import tempfile
 from fractions import Fraction
 
 CODEC_DEFAULTS = {
-    "h264": {"crf": 16, "ext": ".mp4"},
-    "hevc": {"crf": 18, "ext": ".mp4"},
+    "h264": {"crf": 12, "ext": ".mp4"},
+    "hevc": {"crf": 14, "ext": ".mp4"},
     "prores": {"crf": None, "ext": ".mov"},
 }
+
+# Output heights for --youtube. YouTube gives 4K uploads the highest
+# bitrate, which keeps small text (code, terminals) sharp.
+YOUTUBE_HEIGHTS = {"1080p": 1080, "1440p": 1440, "4k": 2160}
+
+# Frame rate used when the source has a variable frame rate (e.g. macOS
+# screen recordings), unless --fps is given.
+VFR_DEFAULT_FPS = 60
 
 
 def run(cmd, **kwargs):
@@ -35,16 +43,22 @@ def probe(input_file):
     if audio is None:
         sys.exit("Error: input has no audio stream (silence detection needs audio).")
 
-    fps = Fraction(video.get("avg_frame_rate", "0/0") if video.get("avg_frame_rate") != "0/0"
-                   else video["r_frame_rate"])
+    r_fps = Fraction(video["r_frame_rate"])
+    avg_fps = Fraction(video.get("avg_frame_rate") or "0/1") if \
+        video.get("avg_frame_rate") != "0/0" else r_fps
+    # Constant frame rate files have r_frame_rate == avg_frame_rate.
+    vfr = avg_fps > 0 and abs(float(r_fps) - float(avg_fps)) / float(avg_fps) > 0.01
     pix_fmt = video.get("pix_fmt", "yuv420p")
     bit_depth = int(video.get("bits_per_raw_sample") or 0) or (10 if "10" in pix_fmt else 8)
 
     return {
-        "duration": float(data["format"]["duration"]),
+        # Only keep the part where both audio and video exist.
+        "duration": min(float(x) for x in (video.get("duration"), audio.get("duration"),
+                                           data["format"]["duration"]) if x),
         "width": int(video["width"]),
         "height": int(video["height"]),
-        "fps": fps.limit_denominator(1001),
+        "fps": (avg_fps if vfr else r_fps).limit_denominator(1001),
+        "vfr": vfr,
         "pix_fmt": pix_fmt,
         "bit_depth": bit_depth,
         "color_primaries": video.get("color_primaries"),
@@ -102,7 +116,25 @@ def build_segments(duration, silence_starts, silence_ends, pad_before, pad_after
     return segments
 
 
-def build_filter(segments, info, denoise):
+def youtube_geometry(width, height, size, anchor):
+    """Crop to exactly 16:9 (no black bars on YouTube), then optionally scale.
+
+    Returns (crop_w, crop_h, crop_x, crop_y, out_w, out_h).
+    """
+    # Largest 16:9 area that fits, in steps of 32x18 so it stays exactly
+    # 16:9 with even dimensions.
+    units = min(width // 32, height // 18)
+    crop_w, crop_h = units * 32, units * 18
+    crop_x = (width - crop_w) // 2 // 2 * 2
+    free_y = height - crop_h
+    crop_y = {"top": 0, "center": free_y // 2 // 2 * 2, "bottom": free_y}[anchor]
+    if size == "native":
+        return crop_w, crop_h, crop_x, crop_y, crop_w, crop_h
+    out_h = YOUTUBE_HEIGHTS[size]
+    return crop_w, crop_h, crop_x, crop_y, out_h * 16 // 9, out_h
+
+
+def build_filter(segments, info, denoise, geometry=None):
     """Build the ffmpeg filter that keeps only the given segments.
 
     Video: select the kept frames and shift their timestamps to close the
@@ -122,13 +154,20 @@ def build_filter(segments, info, denoise):
         if removed:
             offset_terms.append(f"gte(T,{start:.6f})*lt(T,{end:.6f})*{removed:.6f}")
 
-    fps = info["fps"]
+    fps = info["out_fps"]
+    resize = ""
+    if geometry:
+        cw, ch, cx, cy, ow, oh = geometry
+        resize = f"crop={cw}:{ch}:{cx}:{cy},"
+        if (ow, oh) != (cw, ch):
+            resize += f"scale={ow}:{oh}:flags=lanczos,"
+        resize += "setsar=1,"
     # fps would otherwise pad up to the source's end time.
     kept = sum(end - start for start, end in segments)
     video = (
         f"[0:v]select='{'+'.join(select_terms)}',"
         f"setpts='PTS-({'+'.join(offset_terms) or '0'})/TB',"
-        f"fps={fps.numerator}/{fps.denominator},trim=end={kept:.6f}[outv]"
+        f"{resize}fps={fps.numerator}/{fps.denominator},trim=end={kept:.6f}[outv]"
     )
 
     # Every cut point, in order. Pieces alternate between keep and drop.
@@ -241,6 +280,14 @@ def parse_args():
                    help="quality for h264/hevc: lower = better (default: 16 h264, 18 hevc)")
     p.add_argument("--preset", default="slow",
                    help="x264/x265 preset: slower = better compression (default: slow)")
+    p.add_argument("--youtube", nargs="?", const="4k", choices=["native", *YOUTUBE_HEIGHTS],
+                   help="crop to full-screen 16:9 (no black bars) and scale: 4k (default, "
+                        "sharpest on YouTube), 1440p, 1080p, or native (crop only)")
+    p.add_argument("--crop-anchor", choices=["top", "center", "bottom"], default="center",
+                   help="which part to keep when cropping for --youtube (default: center)")
+    p.add_argument("--fps", type=float,
+                   help="output frame rate (default: same as source; "
+                        f"{VFR_DEFAULT_FPS} for variable-frame-rate screen recordings)")
     p.add_argument("--no-denoise", action="store_true", help="turn off audio noise reduction")
     p.add_argument("--dry-run", action="store_true",
                    help="only show what would be cut, do not render")
@@ -259,12 +306,29 @@ def main():
     crf = args.crf if args.crf is not None else CODEC_DEFAULTS[args.codec]["crf"]
 
     info = probe(args.input)
-    print(f"Source: {info['width']}x{info['height']} @ {float(info['fps']):.3f} fps, "
+    print(f"Source: {info['width']}x{info['height']} @ {float(info['fps']):.3f} fps"
+          f"{' (variable)' if info['vfr'] else ''}, "
           f"{info['bit_depth']}-bit {info['pix_fmt']}, {fmt_time(info['duration'])}")
+
+    if args.fps:
+        info["out_fps"] = Fraction(args.fps).limit_denominator(1001)
+    elif info["vfr"]:
+        info["out_fps"] = Fraction(VFR_DEFAULT_FPS)
+    else:
+        info["out_fps"] = info["fps"]
+
+    geometry = None
+    out_w, out_h = info["width"], info["height"]
+    if args.youtube:
+        geometry = youtube_geometry(info["width"], info["height"], args.youtube, args.crop_anchor)
+        cw, ch, cx, cy, out_w, out_h = geometry
+        print(f"YouTube: crop to {cw}x{ch} (16:9, anchor {args.crop_anchor})"
+              f"{f', scale to {out_w}x{out_h}' if (out_w, out_h) != (cw, ch) else ''}")
+    print(f"Output will be: {out_w}x{out_h} @ {float(info['out_fps']):.3f} fps (constant)")
 
     starts, ends = detect_silence(args.input, args.noise, args.min_silence)
     segments = build_segments(info["duration"], starts, ends,
-                              args.pad_before, args.pad_after, info["fps"])
+                              args.pad_before, args.pad_after, info["out_fps"])
     if not segments:
         sys.exit("No speech found. Try a lower --noise value (e.g. -40).")
 
@@ -278,14 +342,14 @@ def main():
             print(f"  {i:4d}. {fmt_time(s):>8} -> {fmt_time(e):>8}  ({e - s:.1f}s)")
         return
 
-    filter_text = build_filter(segments, info, denoise=not args.no_denoise)
+    filter_text = build_filter(segments, info, denoise=not args.no_denoise, geometry=geometry)
     render(args.input, output, filter_text, args.codec, crf, args.preset, info)
 
     out = probe(output)
-    same = (out["width"], out["height"]) == (info["width"], info["height"])
+    ok = (out["width"], out["height"]) == (out_w, out_h)
     print(f"Output: {out['width']}x{out['height']} @ {float(out['fps']):.3f} fps, "
           f"{fmt_time(out['duration'])} "
-          f"({'same resolution as source' if same else 'WARNING: resolution changed!'})")
+          f"({'resolution as expected' if ok else 'WARNING: unexpected resolution!'})")
     print("Done! Saved as", output)
 
 
